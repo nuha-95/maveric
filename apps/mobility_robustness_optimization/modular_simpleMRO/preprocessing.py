@@ -14,8 +14,8 @@ from apps.mobility_robustness_optimization.mobility_robustness_optimization impo
 class Preprocessor(MobilityRobustnessOptimization):
     """Simple preprocessor that inherits from MobilityRobustnessOptimization like SimpleMRO"""
     
-    def __init__(self, mobility_model_params, topology, new_data=None, trained_models=None):
-        super().__init__(mobility_model_params, topology, new_data, trained_models)
+    def __init__(self, mobility_model_params, topology, new_data=None, bdt=None):
+        super().__init__(mobility_model_params, topology, new_data, bdt)
     
     def solve(self):
         """Required abstract method - just calls preprocess_data"""
@@ -23,6 +23,10 @@ class Preprocessor(MobilityRobustnessOptimization):
     
     def preprocess_data(self):
         """Use the exact same preprocessing steps as SimpleMRO.solve()"""
+        
+        # Ensure we have trained models
+        if not self.bayesian_digital_twins:
+            raise ValueError("Bayesian Digital Twins are not available. Need trained models for preprocessing.")
         
         bounds = find_sim_boundary(self.topology, self.new_data)
         self.mobility_model_params["ue_tracks_generation"]["params"]["lat_lon_boundaries"].update(bounds)
@@ -32,7 +36,6 @@ class Preprocessor(MobilityRobustnessOptimization):
         
         if self.topology["cell_id"].dtype == int:
             self.topology["cell_id"] = self.topology["cell_id"].apply(lambda x: f"cell_{int(x)}")
-        
         
         predictions, full_prediction_df = self._predictions(self.simulation_data)
         self.simulation_data = full_prediction_df
@@ -57,7 +60,7 @@ def main():
     
     # Load trained models
     with open(args.trained_model, 'rb') as f:
-        trained_models = pickle.load(f)
+        bdt_models = pickle.load(f)
     
     
     mobility_model_params = {
@@ -85,7 +88,7 @@ def main():
     }
     
     # Create preprocessor and process data
-    preprocessor = Preprocessor(mobility_model_params, topology, new_data, trained_models)
+    preprocessor = Preprocessor(mobility_model_params, topology, new_data, bdt_models)
     processed_data = preprocessor.preprocess_data()
     
     # Save processed data

@@ -11,9 +11,8 @@ import json
 maveric_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
 sys.path.insert(0, maveric_root)
 
-from preprocessing import preprocess_prediction_data, add_sinr_column, compute_row_level_sinr
+from preprocessing import Preprocessor
 import numpy as np
-from training import BayesianTrainer
 
 # Add parent directory to path for MRO imports
 sys.path.insert(0, os.path.join(maveric_root, 'apps', 'mobility_robustness_optimization'))
@@ -29,74 +28,49 @@ class SimpleMROInference:
 
     def __init__(self, topology: pd.DataFrame, trained_models: dict):
         self.topology = topology
-        self.trainer = BayesianTrainer(topology)
-        self.trainer.bayesian_digital_twins = trained_models
+        self.trained_models = trained_models
         self.logger = logging.getLogger(__name__)
 
-    def predict_rf(self, location_data: pd.DataFrame) -> pd.DataFrame:
-        """Predict RF power for given locations using trained models."""
-        if not self.trainer.bayesian_digital_twins:
-            raise ValueError("No trained models available for prediction.")
-
-        # Check if data is already processed (has required columns)
-        required_prediction_cols = ['cell_id', 'log_distance', 'relative_bearing']
-        is_preprocessed = all(col in location_data.columns for col in required_prediction_cols)
+    def get_preprocessed_data(self, ue_data: pd.DataFrame = None) -> pd.DataFrame:
+        """Get preprocessed simulation data using Preprocessor."""
+        mobility_model_params = {
+            "ue_tracks_generation": {
+                "params": {
+                    "simulation_duration": 3600,
+                    "simulation_time_interval_seconds": 0.01,
+                    "num_ticks": 50,
+                    "num_batches": 1,
+                    "ue_class_distribution": {
+                        "stationary": {"count": 10, "velocity": 0, "velocity_variance": 1},
+                        "pedestrian": {"count": 5, "velocity": 2, "velocity_variance": 1},
+                        "cyclist": {"count": 5, "velocity": 5, "velocity_variance": 1},
+                        "car": {"count": 12, "velocity": 20, "velocity_variance": 1}
+                    },
+                    "lat_lon_boundaries": {
+                        "min_lat": -90, "max_lat": 90, "min_lon": -180, "max_lon": 180
+                    },
+                    "gauss_markov_params": {
+                        "alpha": 0.5, "variance": 0.8, "rng_seed": 42,
+                        "lon_x_dims": 100, "lon_y_dims": 100
+                    }
+                }
+            }
+        }
         
-        if is_preprocessed:
-            # Data is already preprocessed, use it directly
-            prediction_data = location_data.copy()
-        else:
-            # Ensure required columns exist for preprocessing
-            required_cols = ['longitude', 'latitude']
-            if not all(col in location_data.columns for col in required_cols):
-                raise ValueError(f"Input data must contain columns: {required_cols}")
+        preprocessor = Preprocessor(mobility_model_params, self.topology, ue_data, self.trained_models)
+        return preprocessor.preprocess_data()
 
-            # Add tick column if missing
-            if 'tick' not in location_data.columns:
-                location_data = location_data.copy()
-                location_data['tick'] = 0  # Single time point
-
-            # Preprocess data for prediction
-            prediction_data = preprocess_prediction_data(location_data, self.topology)
-        
-        results = pd.DataFrame()
-
-        # Make predictions for each cell
-        for cell_id, cell_df in prediction_data.groupby("cell_id"):
-            # Handle both string and integer cell_id formats
-            if isinstance(cell_id, str) and cell_id.startswith('cell_'):
-                cell_id_str = cell_id
-            else:
-                cell_id_str = f"cell_{cell_id}"
-            
-            if cell_id_str in self.trainer.bayesian_digital_twins:
-                try:
-                    pred_means, _ = self.trainer.bayesian_digital_twins[cell_id_str].predict_distributed_gpmodel(
-                        prediction_dfs=[cell_df]
-                    )
-                    cell_df = cell_df.copy()
-                    cell_df["predicted_rxpower_dbm"] = pred_means[0]
-                    cell_df["cell_id"] = cell_id_str
-                    results = pd.concat([results, cell_df], ignore_index=True)
-                except Exception as e:
-                    self.logger.warning(f"Prediction failed for {cell_id_str}: {e}")
-            else:
-                self.logger.warning(f"No model for {cell_id_str}")
-
-        return results
-
-    def mro_inference(self, ue_data: pd.DataFrame, n_epochs: int = 5) -> dict:
+    def mro_inference(self, ue_data: pd.DataFrame = None, n_epochs: int = 5) -> dict:
         """Perform MRO optimization to find optimal hysteresis and TTT parameters."""
-        # Get RF predictions and prepare simulation data
-        rf_predictions = self.predict_rf(ue_data)
-        rf_with_sinr = add_sinr_column(rf_predictions)
-        simulation_data = self._prepare_for_attachment(rf_with_sinr)
+        # Get preprocessed simulation data
+        simulation_data = self.get_preprocessed_data(ue_data)
         
         # Initialize optimization parameters
-        max_diff = self._find_hyst_diff(simulation_data)
-        num_ticks = simulation_data["tick"].nunique() if "tick" in simulation_data.columns else 50
-        hyst_range = [0.01, max(max_diff, 5.0)]  # Ensure minimum range
-        ttt_range = [2, max(10, min(num_ticks + 1, 50))]  # Ensure minimum range
+        from radp.digital_twin.utils.cell_selection import find_hyst_diff
+        max_diff = find_hyst_diff(simulation_data)
+        num_ticks = simulation_data["tick"].nunique()
+        hyst_range = [0, max_diff]
+        ttt_range = [2, num_ticks + 1]
         
         # Track scores
         scores = []
@@ -134,40 +108,14 @@ class SimpleMROInference:
             'all_scores': scores
         }
     
-    def _prepare_for_attachment(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Prepare data for attachment function by converting to expected format."""
-        attachment_data = data.copy()
-        
-        # Rename columns to match expected format
-        column_mapping = {
-            'mock_ue_id': 'ue_id',
-            'predicted_rxpower_dbm': 'cell_rxpower_dbm',
-            'log_distance': 'distance_km'
-        }
-        
-        for old_col, new_col in column_mapping.items():
-            if old_col in attachment_data.columns:
-                attachment_data = attachment_data.rename(columns={old_col: new_col})
-        
-        # Convert cell_id to integer if it's string format
-        if attachment_data['cell_id'].dtype == object:
-            attachment_data['cell_id'] = attachment_data['cell_id'].str.extract(r'(\d+)').astype(int)
-        
-        return attachment_data
-    
-    def _find_hyst_diff(self, data: pd.DataFrame) -> float:
-        """Find maximum hysteresis difference from simulation data."""
-        if 'cell_rxpower_dbm' in data.columns:
-            power_values = data['cell_rxpower_dbm'].values
-            return float(np.max(power_values) - np.min(power_values))
-        return 10.0  # Default value
+
 
 
 def main():
     """Command line interface for MRO inference."""
     parser = argparse.ArgumentParser(description='Perform MRO optimization using trained models')
     parser.add_argument('--topology', required=True, help='Path to topology CSV file')
-    parser.add_argument('--ue-data', required=True, help='Path to UE data CSV file')
+    parser.add_argument('--ue-data', help='Path to UE data CSV file (optional, uses mobility params if not provided)')
     parser.add_argument('--trained-model', required=True, help='Path to pre-trained model pickle file')
     parser.add_argument('--epochs', type=int, default=5, help='Number of optimization epochs')
     parser.add_argument('--output', required=True, help='Path to save MRO inference results CSV file')
@@ -178,7 +126,7 @@ def main():
     try:
         # Load data
         topology = pd.read_csv(args.topology)
-        ue_data = pd.read_csv(args.ue_data)
+        ue_data = pd.read_csv(args.ue_data) if args.ue_data else None
         
         # Load pre-trained model
         with open(args.trained_model, 'rb') as f:
@@ -188,26 +136,21 @@ def main():
         inference_engine = SimpleMROInference(topology, trained_models)
         
         if args.mode == 'rf':
-            # RF prediction only
-            print(f"Predicting RF power for {len(ue_data)} locations...")
-            results = inference_engine.predict_rf(ue_data)
+            # RF prediction only (preprocessed data)
+            print("Getting preprocessed simulation data...")
+            results = inference_engine.get_preprocessed_data(ue_data)
             results.to_csv(args.output, index=False)
-            print(f"RF predictions completed for {len(results)} location-cell combinations")
-            print(f"Results saved to {args.output}")
+            print(f"Preprocessed data with {len(results)} rows saved to {args.output}")
         else:
             # Full MRO optimization
             print("Solving MRO optimization...")
-            logger.info("Epoch  Hyst           TTT    MRO Metric  ")
-            logger.info("-----------------------------------------")
             
             mro_results = inference_engine.mro_inference(ue_data, args.epochs)
-            
-            logger.info(f"\nOptimized Hyst: {mro_results['hysteresis']}")
-            logger.info(f"Optimized TTT: {mro_results['ttt']}")
             
             print("\nResults:")
             print(f"Optimal Hysteresis: {mro_results['hysteresis']:.6f}")
             print(f"Optimal TTT: {mro_results['ttt']}")
+            print(f"Best MRO Metric: {mro_results['mro_metric']:.6f}")
             
             # Save detailed results
             mro_results['attached_data'].to_csv(args.output, index=False)
