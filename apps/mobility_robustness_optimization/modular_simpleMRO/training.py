@@ -12,18 +12,15 @@ sys.path.insert(0, maveric_root)
 from gpytorch.utils.warnings import NumericalWarning
 from radp.digital_twin.utils.cell_selection import find_hyst_diff, perform_attachment_hyst_ttt
 from radp.digital_twin.utils.constants import RLF_THRESHOLD
-from apps.mobility_robustness_optimization.mobility_robustness_optimization import calculate_mro_metric
-from preprocessing import Preprocessor
+from apps.mobility_robustness_optimization.mobility_robustness_optimization import calculate_mro_metric, MobilityRobustnessOptimization
 
 
-class MROTrainer:
-    """MRO training that uses preprocessed data and performs optimization like SimpleMRO"""
+class MROTrainer(MobilityRobustnessOptimization):
+    """MRO training that inherits from MobilityRobustnessOptimization for BDT training"""
     
-    def __init__(self, mobility_model_params, topology, new_data, bdt_models):
-        self.mobility_model_params = mobility_model_params
-        self.topology = topology
-        self.new_data = new_data
-        self.bdt_models = bdt_models
+    def __init__(self, mobility_model_params, topology, new_data=None, training_data=None):
+        super().__init__(mobility_model_params, topology, new_data)
+        self.training_data = training_data
         
         logging.basicConfig(
             level=logging.INFO,
@@ -31,18 +28,40 @@ class MROTrainer:
         )
         self.logger = logging.getLogger(__name__)
     
-    def train(self, n_epochs=100):
-        """Train MRO using preprocessed data - similar to SimpleMRO.solve()"""
+    def solve(self):
+        """Required abstract method implementation"""
+        return self.train_complete_mro()
+    
+    def train_bdt_if_needed(self):
+        """Train BDT models if training data is provided"""
+        if self.training_data is not None:
+            print("Training BDT models from scratch...")
+            self.train_or_update_rf_twins(self.training_data)
+        elif not self.bayesian_digital_twins:
+            raise ValueError("No BDT models available and no training data provided")
+    
+    def train_complete_mro(self, n_epochs=100):
+        """Train complete MRO: BDT + optimization"""
         
-        # Use preprocessor to get simulation data
-        preprocessor = Preprocessor(
-            self.mobility_model_params, 
-            self.topology, 
-            self.new_data, 
-            self.bdt_models
-        )
+        # Train BDT models if needed
+        self.train_bdt_if_needed()
         
-        self.simulation_data = preprocessor.preprocess_data()
+        # Generate simulation data using MRO's internal methods
+        from notebooks.radp_library import find_sim_boundary, get_ue_data
+        
+        bounds = find_sim_boundary(self.topology, self.new_data)
+        self.mobility_model_params["ue_tracks_generation"]["params"]["lat_lon_boundaries"].update(bounds)
+        
+        self.simulation_data = get_ue_data(self.mobility_model_params)
+        self.simulation_data = self.simulation_data.rename(columns={"lat": "latitude", "lon": "longitude"})
+        
+        if self.topology["cell_id"].dtype == int:
+            self.topology["cell_id"] = self.topology["cell_id"].apply(lambda x: f"cell_{int(x)}")
+        
+        # Use MRO's internal prediction and preprocessing methods
+        predictions, full_prediction_df = self._predictions(self.simulation_data)
+        self.simulation_data = full_prediction_df
+        self.simulation_data = self._preprocess_simulation_data(self.simulation_data)
         
         # MRO optimization part (from SimpleMRO.solve lines 77-101)
         epochs = n_epochs
@@ -83,9 +102,10 @@ class MROTrainer:
         self.logger.info(f"\nOptimized Hyst: {self.score.loc[self.score['score'].idxmax(), 'hyst']}")
         self.logger.info(f"Optimized TTT: {int(self.score.loc[self.score['score'].idxmax(), 'ttt'])}")
         
-        return self.score.loc[self.score["score"].idxmax(), "hyst"], int(
-            self.score.loc[self.score["score"].idxmax(), "ttt"]
-        )
+        optimal_hyst = self.score.loc[self.score["score"].idxmax(), "hyst"]
+        optimal_ttt = int(self.score.loc[self.score["score"].idxmax(), "ttt"])
+        
+        return optimal_hyst, optimal_ttt
 
 
 def main():
@@ -93,19 +113,24 @@ def main():
     parser = argparse.ArgumentParser(description='MRO training using trained BDT models')
     parser.add_argument('--topology', required=True, help='Path to topology CSV file')
     parser.add_argument('--ue-data', help='Path to UE data CSV file (optional, uses mobility params if not provided)')
-    parser.add_argument('--bdt-models', required=True, help='Path to trained BDT models pickle file')
+    parser.add_argument('--bdt-models', help='Path to trained BDT models pickle file (optional if training-data provided)')
+    parser.add_argument('--training-data', help='Path to training data CSV file for BDT training')
     parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
     parser.add_argument('--output', required=True, help='Path to output results CSV file')
+    parser.add_argument('--save-models', action='store_true', help='Save complete MRO model (BDT + optimal parameters) to .pkl file')
     
     args = parser.parse_args()
     
     # Load data
     topology = pd.read_csv(args.topology)
     new_data = pd.read_csv(args.ue_data) if args.ue_data else None
+    training_data = pd.read_csv(args.training_data) if args.training_data else None
     
-    # Load trained BDT models
-    with open(args.bdt_models, 'rb') as f:
-        bdt_models = pickle.load(f)
+    # Load BDT models if provided
+    bdt_models = None
+    if args.bdt_models:
+        with open(args.bdt_models, 'rb') as f:
+            bdt_models = pickle.load(f)
     
     mobility_model_params = {
         "ue_tracks_generation": {
@@ -131,12 +156,32 @@ def main():
         }
     }
     
-    # Create MRO trainer and train
-    trainer = MROTrainer(mobility_model_params, topology, new_data, bdt_models)
-    optimal_hyst, optimal_ttt = trainer.train(args.epochs)
+    # Create MRO trainer
+    trainer = MROTrainer(mobility_model_params, topology, new_data, training_data)
+    
+    # Set BDT models if loaded
+    if bdt_models:
+        trainer.bayesian_digital_twins = bdt_models
+    
+    # Train complete MRO
+    optimal_hyst, optimal_ttt = trainer.train_complete_mro(args.epochs)
     
     # Save results
     trainer.score.to_csv(args.output, index=False)
+    
+    # Save complete MRO model (BDT + optimal parameters)
+    if args.save_models:
+        model_output = args.output.replace('.csv', '_complete.pkl')
+        mro_complete_model = {
+            'bdt_models': trainer.bayesian_digital_twins,
+            'optimal_hysteresis': optimal_hyst,
+            'optimal_ttt': optimal_ttt,
+            'mobility_model_params': mobility_model_params,
+            'topology': topology
+        }
+        with open(model_output, 'wb') as f:
+            pickle.dump(mro_complete_model, f)
+        print(f"Complete MRO model saved to {model_output}")
     
     print(f"MRO training completed!")
     print(f"Results saved to {args.output}")

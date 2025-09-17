@@ -26,9 +26,11 @@ logger = logging.getLogger(__name__)
 class SimpleMROInference:
     """Inference module for SimpleMRO - handles RF prediction and MRO optimization inference."""
 
-    def __init__(self, topology: pd.DataFrame, trained_models: dict):
+    def __init__(self, topology: pd.DataFrame, trained_models: dict, optimal_hyst: float = None, optimal_ttt: int = None):
         self.topology = topology
         self.trained_models = trained_models
+        self.optimal_hyst = optimal_hyst
+        self.optimal_ttt = optimal_ttt
         self.logger = logging.getLogger(__name__)
 
     def get_preprocessed_data(self, ue_data: pd.DataFrame = None) -> pd.DataFrame:
@@ -61,52 +63,67 @@ class SimpleMROInference:
         return preprocessor.preprocess_data()
 
     def mro_inference(self, ue_data: pd.DataFrame = None, n_epochs: int = 5) -> dict:
-        """Perform MRO optimization to find optimal hysteresis and TTT parameters."""
+        """Perform MRO inference using optimal parameters or optimization."""
         # Get preprocessed simulation data
         simulation_data = self.get_preprocessed_data(ue_data)
         
-        # Initialize optimization parameters
-        from radp.digital_twin.utils.cell_selection import find_hyst_diff
-        max_diff = find_hyst_diff(simulation_data)
-        num_ticks = simulation_data["tick"].nunique()
-        hyst_range = [0, max_diff]
-        ttt_range = [2, num_ticks + 1]
-        
-        # Track scores
-        scores = []
-        best_score = float('-inf')
-        best_hyst = 0.01
-        best_ttt = 5
-        
-        # Run optimization epochs
-        for epoch in range(n_epochs):
-            # Generate random parameters
-            hyst = np.random.uniform(hyst_range[0], hyst_range[1])
-            ttt = np.random.randint(ttt_range[0], ttt_range[1])
-            
-            # Perform attachment and calculate MRO metric
-            attached_df = perform_attachment_hyst_ttt(simulation_data, hyst, ttt, RLF_THRESHOLD)
+        # Use optimal parameters if available, otherwise optimize
+        if self.optimal_hyst is not None and self.optimal_ttt is not None:
+            print(f"Using pre-trained optimal parameters: Hyst={self.optimal_hyst:.6f}, TTT={self.optimal_ttt}")
+            attached_df = perform_attachment_hyst_ttt(simulation_data, self.optimal_hyst, self.optimal_ttt, RLF_THRESHOLD)
             mro_metric = calculate_mro_metric(attached_df)
             
-            # Track best score
-            if mro_metric > best_score:
-                best_score = mro_metric
-                best_hyst = hyst
-                best_ttt = ttt
+            return {
+                'hysteresis': self.optimal_hyst,
+                'ttt': self.optimal_ttt,
+                'mro_metric': mro_metric,
+                'attached_data': attached_df,
+                'all_scores': [{'hyst': self.optimal_hyst, 'ttt': self.optimal_ttt, 'score': mro_metric}]
+            }
+        else:
+            print("No optimal parameters found. Running optimization...")
+            # Initialize optimization parameters
+            from radp.digital_twin.utils.cell_selection import find_hyst_diff
+            max_diff = find_hyst_diff(simulation_data)
+            num_ticks = simulation_data["tick"].nunique()
+            hyst_range = [0, max_diff]
+            ttt_range = [2, num_ticks + 1]
             
-            scores.append({'hyst': hyst, 'ttt': ttt, 'score': mro_metric})
-            self.logger.info(f"{epoch:<6} {hyst:<14.10f} {ttt:<6} {mro_metric:<12.6f}")
-        
-        # Final attachment with best parameters
-        final_attached_df = perform_attachment_hyst_ttt(simulation_data, best_hyst, best_ttt, RLF_THRESHOLD)
-        
-        return {
-            'hysteresis': best_hyst,
-            'ttt': best_ttt,
-            'mro_metric': best_score,
-            'attached_data': final_attached_df,
-            'all_scores': scores
-        }
+            # Track scores
+            scores = []
+            best_score = float('-inf')
+            best_hyst = 0.01
+            best_ttt = 5
+            
+            # Run optimization epochs
+            for epoch in range(n_epochs):
+                # Generate random parameters
+                hyst = np.random.uniform(hyst_range[0], hyst_range[1])
+                ttt = np.random.randint(ttt_range[0], ttt_range[1])
+                
+                # Perform attachment and calculate MRO metric
+                attached_df = perform_attachment_hyst_ttt(simulation_data, hyst, ttt, RLF_THRESHOLD)
+                mro_metric = calculate_mro_metric(attached_df)
+                
+                # Track best score
+                if mro_metric > best_score:
+                    best_score = mro_metric
+                    best_hyst = hyst
+                    best_ttt = ttt
+                
+                scores.append({'hyst': hyst, 'ttt': ttt, 'score': mro_metric})
+                self.logger.info(f"{epoch:<6} {hyst:<14.10f} {ttt:<6} {mro_metric:<12.6f}")
+            
+            # Final attachment with best parameters
+            final_attached_df = perform_attachment_hyst_ttt(simulation_data, best_hyst, best_ttt, RLF_THRESHOLD)
+            
+            return {
+                'hysteresis': best_hyst,
+                'ttt': best_ttt,
+                'mro_metric': best_score,
+                'attached_data': final_attached_df,
+                'all_scores': scores
+            }
     
 
 
@@ -130,10 +147,24 @@ def main():
         
         # Load pre-trained model
         with open(args.trained_model, 'rb') as f:
-            trained_models = pickle.load(f)
+            model_data = pickle.load(f)
+        
+        # Check if it's a complete MRO model or just BDT models
+        if isinstance(model_data, dict) and 'bdt_models' in model_data:
+            # Complete MRO model with optimal parameters
+            trained_models = model_data['bdt_models']
+            optimal_hyst = model_data.get('optimal_hysteresis')
+            optimal_ttt = model_data.get('optimal_ttt')
+            print(f"Loaded complete MRO model with optimal parameters")
+        else:
+            # Just BDT models
+            trained_models = model_data
+            optimal_hyst = None
+            optimal_ttt = None
+            print(f"Loaded BDT models only")
         
         # Initialize inference engine
-        inference_engine = SimpleMROInference(topology, trained_models)
+        inference_engine = SimpleMROInference(topology, trained_models, optimal_hyst, optimal_ttt)
         
         if args.mode == 'rf':
             # RF prediction only (preprocessed data)
