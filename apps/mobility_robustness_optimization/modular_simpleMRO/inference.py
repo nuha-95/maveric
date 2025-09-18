@@ -72,6 +72,7 @@ class SimpleMROInference:
             print(f"Using pre-trained optimal parameters: Hyst={self.optimal_hyst:.6f}, TTT={self.optimal_ttt}")
             attached_df = perform_attachment_hyst_ttt(simulation_data, self.optimal_hyst, self.optimal_ttt, RLF_THRESHOLD)
             mro_metric = calculate_mro_metric(attached_df)
+            print(f"MRO Metric Score: {mro_metric:.6f}")
             
             return {
                 'hysteresis': self.optimal_hyst,
