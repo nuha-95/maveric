@@ -57,7 +57,7 @@ class MROTrainer(MobilityRobustnessOptimization):
         
         self.simulation_data = preprocessor.preprocess_data()
         
-        # MRO optimization part (from SimpleMRO.solve lines 77-101)
+        
         epochs = n_epochs
         hyst = 0.01
         ttt = 5
@@ -157,13 +157,13 @@ def main():
     if bdt_models:
         trainer.bayesian_digital_twins = bdt_models
     
-    # Train complete MRO
+    # Train MRO
     optimal_hyst, optimal_ttt = trainer.train_mro(args.epochs)
     
     # Save results
     trainer.score.to_csv(args.output, index=False)
     
-    # Save complete MRO model (BDT + optimal parameters)
+    
     if args.save_models:
         model_output = args.output.replace('.csv', '_complete.pkl')
         mro_complete_model = {
@@ -175,7 +175,7 @@ def main():
         }
         with open(model_output, 'wb') as f:
             pickle.dump(mro_complete_model, f)
-        print(f"Complete MRO model saved to {model_output}")
+        print(f"MRO model saved to {model_output}")
     
     print(f"MRO training completed!")
     print(f"Results saved to {args.output}")
