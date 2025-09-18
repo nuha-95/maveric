@@ -13,10 +13,11 @@ from gpytorch.utils.warnings import NumericalWarning
 from radp.digital_twin.utils.cell_selection import find_hyst_diff, perform_attachment_hyst_ttt
 from radp.digital_twin.utils.constants import RLF_THRESHOLD
 from apps.mobility_robustness_optimization.mobility_robustness_optimization import calculate_mro_metric, MobilityRobustnessOptimization
+from preprocessing import Preprocessor
 
 
 class MROTrainer(MobilityRobustnessOptimization):
-    """MRO training that inherits from MobilityRobustnessOptimization for BDT training"""
+    
     
     def __init__(self, mobility_model_params, topology, new_data=None, training_data=None):
         super().__init__(mobility_model_params, topology, new_data)
@@ -30,9 +31,9 @@ class MROTrainer(MobilityRobustnessOptimization):
     
     def solve(self):
         """Required abstract method implementation"""
-        return self.train_complete_mro()
+        return self.train_mro()
     
-    def train_bdt_if_needed(self):
+    def train_bdt(self):
         """Train BDT models if training data is provided"""
         if self.training_data is not None:
             print("Training BDT models from scratch...")
@@ -40,28 +41,21 @@ class MROTrainer(MobilityRobustnessOptimization):
         elif not self.bayesian_digital_twins:
             raise ValueError("No BDT models available and no training data provided")
     
-    def train_complete_mro(self, n_epochs=100):
+    def train_mro(self, n_epochs=100):
         """Train complete MRO: BDT + optimization"""
         
         # Train BDT models if needed
-        self.train_bdt_if_needed()
+        self.train_bdt()
         
-        # Generate simulation data using MRO's internal methods
-        from notebooks.radp_library import find_sim_boundary, get_ue_data
+        # Use Preprocessor for consistent data preparation
+        preprocessor = Preprocessor(
+            self.mobility_model_params,
+            self.topology,
+            self.new_data,
+            self.bayesian_digital_twins
+        )
         
-        bounds = find_sim_boundary(self.topology, self.new_data)
-        self.mobility_model_params["ue_tracks_generation"]["params"]["lat_lon_boundaries"].update(bounds)
-        
-        self.simulation_data = get_ue_data(self.mobility_model_params)
-        self.simulation_data = self.simulation_data.rename(columns={"lat": "latitude", "lon": "longitude"})
-        
-        if self.topology["cell_id"].dtype == int:
-            self.topology["cell_id"] = self.topology["cell_id"].apply(lambda x: f"cell_{int(x)}")
-        
-        # Use MRO's internal prediction and preprocessing methods
-        predictions, full_prediction_df = self._predictions(self.simulation_data)
-        self.simulation_data = full_prediction_df
-        self.simulation_data = self._preprocess_simulation_data(self.simulation_data)
+        self.simulation_data = preprocessor.preprocess_data()
         
         # MRO optimization part (from SimpleMRO.solve lines 77-101)
         epochs = n_epochs
@@ -164,7 +158,7 @@ def main():
         trainer.bayesian_digital_twins = bdt_models
     
     # Train complete MRO
-    optimal_hyst, optimal_ttt = trainer.train_complete_mro(args.epochs)
+    optimal_hyst, optimal_ttt = trainer.train_mro(args.epochs)
     
     # Save results
     trainer.score.to_csv(args.output, index=False)
